@@ -1,4 +1,4 @@
-# 📧 LARK-MAIL 邮件监控推送
+# 📧 LARK-MAIL-Webhook 邮件监控推送
 
 [![Python](https://img.shields.io/badge/Python-3.7+-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Docker](https://img.shields.io/badge/Docker%20Compose-✓-2496ED?logo=docker&logoColor=white)](docker-compose.yml)
