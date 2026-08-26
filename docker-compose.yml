@@ -1,0 +1,12 @@
+version: '3'
+services:
+  imap-relay:
+    image: python:3.9-slim
+    container_name: lark-mail
+    restart: always
+    working_dir: /app
+    volumes:
+      - ./lark-mail.py:/app/lark-mail.py
+    command: sh -c "pip install requests && python -u lark-mail.py"
+    env_file:
+      - .env
