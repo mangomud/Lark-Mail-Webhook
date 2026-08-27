@@ -87,7 +87,7 @@ def load_accounts():
     cfg['feishu_webhook'] = webhook
     return [cfg]
 
-# ---------- 安全解码函数（全局） ----------
+# ---------- 安全解码函数 ----------
 def safe_decode(payload, charset):
     """安全解码字节内容，处理未知编码和错误"""
     if not payload:
@@ -95,17 +95,15 @@ def safe_decode(payload, charset):
     try:
         return payload.decode(charset or 'utf-8', errors='replace')
     except (LookupError, UnicodeDecodeError):
-        # 回退到常见编码
         for enc in ('utf-8', 'gb18030', 'latin-1'):
             try:
                 return payload.decode(enc, errors='replace')
             except (LookupError, UnicodeDecodeError):
                 continue
-        # 最终使用 ascii
         return payload.decode('ascii', errors='replace')
 
 def decode_mime_header(header_value):
-    """解码 MIME 编码的邮件头，安全处理未知编码"""
+    """解码 MIME 编码的邮件头"""
     if not header_value:
         return ''
     decoded_parts = decode_header(header_value)
@@ -155,11 +153,12 @@ def contains_blocked_keyword(text, blocked_keywords):
     return any(kw in text_lower for kw in blocked_keywords)
 
 def imap_fetch_unseen_raw(config, limit=None):
+    """连接 IMAP，获取指定时间范围内的未读邮件，不标记已读"""
     mail = imaplib.IMAP4_SSL(config['imap_server'], config['imap_port'])
     if config['debug']:
         mail.debug = 4
 
-    # 发送 ID 命令
+    # 发送 ID 命令（模拟 Outlook，避免 Unsafe Login）
     if 'ID' not in imaplib.Commands:
         imaplib.Commands['ID'] = ('AUTH', 'SELECTED', 'NONAUTH')
     try:
@@ -178,7 +177,11 @@ def imap_fetch_unseen_raw(config, limit=None):
     if typ != 'OK':
         raise Exception(f"SELECT 失败: {data}")
 
-    typ, data = mail.uid('search', None, 'UNSEEN')
+    # 计算 SINCE 日期（格式：DD-Mon-YYYY）
+    since_date = (datetime.now(timezone.utc) - timedelta(seconds=config['block_before'])).strftime('%d-%b-%Y')
+    search_criteria = f'(UNSEEN SINCE {since_date})'
+
+    typ, data = mail.uid('search', None, search_criteria)
     if typ != 'OK':
         raise Exception(f"SEARCH 失败: {data}")
 
@@ -190,7 +193,7 @@ def imap_fetch_unseen_raw(config, limit=None):
     if limit and limit > 0:
         uid_list = uid_list[:limit]
 
-    print(f"[{config['imap_user']}] Found {len(uid_list)} unseen emails")
+    print(f"[{config['imap_user']}] Found {len(uid_list)} unseen emails since {since_date}")
 
     raw_emails = []
     for uid in uid_list:
@@ -209,6 +212,7 @@ def imap_fetch_unseen_raw(config, limit=None):
     return mail, raw_emails
 
 def send_to_feishu(config, subject, from_addr, date_str, body_preview):
+    """发送飞书消息，成功返回 True，失败返回 False"""
     webhook = config['feishu_webhook']
     if not webhook:
         return False
@@ -260,6 +264,7 @@ def send_to_feishu(config, subject, from_addr, date_str, body_preview):
             return False
 
 def monitor_account(config):
+    """单个账户的监控主循环（独立线程）"""
     imap_user = config['imap_user']
     blocked_keywords = [kw.strip().lower() for kw in config['blocked_keywords'].split(',') if kw.strip()]
 
@@ -301,17 +306,17 @@ def monitor_account(config):
                     else:
                         formatted_date = raw_date
 
-                    # 时间过滤：不推送，不标记已读
+                    # 时间过滤（双重保险，通常不会触发，因为服务器已过滤）
                     if mail_date and mail_date < cutoff_time:
                         print(f"[{imap_user}] ⏭️  跳过旧邮件（保持未读）: {subject}")
                         continue
 
-                    # 屏蔽词过滤：不推送，不标记已读
+                    # 屏蔽词过滤：不推送，保持未读
                     if contains_blocked_keyword(subject, blocked_keywords) or contains_blocked_keyword(body, blocked_keywords):
                         print(f"[{imap_user}] 🚫 命中屏蔽词（保持未读）: {subject}")
                         continue
 
-                    # 尝试推送，成功后才标记已读
+                    # 推送成功后才标记已读
                     body_preview = body[:500] + ('...' if len(body) > 500 else '')
                     push_success = send_to_feishu(config, subject, from_addr, formatted_date, body_preview)
 
