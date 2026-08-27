@@ -1,6 +1,7 @@
 version: '3'
+
 services:
-  imap-relay:
+  lark-mail:
     image: python:3.9-slim
     container_name: lark-mail
     restart: always
@@ -8,5 +9,43 @@ services:
     volumes:
       - ./lark-mail.py:/app/lark-mail.py
     command: sh -c "pip install requests && python -u lark-mail.py"
-    env_file:
-      - .env
+    environment:
+      # ============================================================
+      # 环境变量通过 ${VAR:-默认值} 语法从 .env 文件引入:
+      #   1. 复制 .env.example 为 .env,在 .env 中填写你的配置
+      #   2. docker compose 启动时自动读取同目录 .env 并替换
+      #   3. 若某变量在 .env 中未设置(或留空),则使用这里写死的默认值
+      # 日常只需改 .env,无需修改本文件。
+      # ============================================================
+
+      # ---- 邮箱 / 推送配置(单账户模式,在 .env 中填写)----
+      - IMAP_USER=${IMAP_USER:-}                  # 邮箱账号(单账户模式必填)
+      - IMAP_PASS=${IMAP_PASS:-}                  # 授权码,不是登录密码!(单账户模式必填)
+      - FEISHU_WEBHOOKS=${FEISHU_WEBHOOKS:-}      # 飞书机器人 Webhook 地址(单账户模式必填)
+      - BLOCKED_KEYWORDS=${BLOCKED_KEYWORDS:-}    # 屏蔽词,逗号分隔(可选)
+
+      # ---- 多账户模式(推荐,可同时监控多个邮箱)----
+      # 设置 MAIL_ACCOUNTS_JSON 后,脚本【优先】使用它,上面的单账户变量被忽略。
+      # 每个账户独立线程并行监控,支持字段:
+      #   imap_user          邮箱账号(必填)
+      #   imap_pass          授权码,不是登录密码(必填)
+      #   feishu_webhook     飞书机器人 Webhook 地址(必填)
+      #   blocked_keywords   屏蔽词,逗号分隔;命中主题/正文则跳过(可选)
+      #
+      # 方式一(推荐):在 .env 中配置 MAIL_ACCOUNTS_JSON(参考 .env.example),此处自动引入:
+      - MAIL_ACCOUNTS_JSON=${MAIL_ACCOUNTS_JSON:-}
+      #
+      # 方式二:也可把 JSON 直接写死在本文件,把下面一行取消注释并替换内容
+      # ⚠️⚠️⚠️ 重要:JSON 必须写成【一整行】,严禁换行!
+      #   换行会让 YAML/.env 把值拆成多行,json.loads 解析失败,服务无法启动。
+      # - MAIL_ACCOUNTS_JSON=[{"imap_user":"user1@163.com","imap_pass":"授权码1","feishu_webhook":"https://open.feishu.cn/open-apis/bot/v2/hook/xxx","blocked_keywords":"广告,推广"}]
+
+      # ---- 全局默认值(一般无需修改,可在 .env 中覆盖)----
+      - IMAP_SERVER=${IMAP_SERVER:-imap.163.com}  # IMAP 服务器地址
+      - IMAP_PORT=${IMAP_PORT:-993}               # IMAP SSL 端口
+      - MAILBOX=${MAILBOX:-INBOX}                 # 监听的邮箱文件夹
+      - BLOCK_BEFORE=${BLOCK_BEFORE:-86400}       # 跳过 24 小时(86400 秒)前的邮件
+      - MAX_EMAILS_PER_RUN=${MAX_EMAILS_PER_RUN:-50}  # 每次轮询最多处理 50 封
+      - BATCH_DELAY=${BATCH_DELAY:-2}             # 每封邮件间隔 2 秒,防飞书限流
+      - POLL_INTERVAL=${POLL_INTERVAL:-60}        # 轮询间隔 60 秒
+      - DEBUG=${DEBUG:-false}                     # true 时输出 IMAP 交互详情
