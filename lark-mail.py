@@ -238,22 +238,35 @@ def imap_connect(config):
 def imap_fetch_unseen(config, mail, limit=None):
     """在已建立的连接上拉取未读邮件。
 
+    - 只在搜索阶段就限定最近 block_before 秒内的未读邮件(SEARCH ... SINCE),
+      从源头过滤远古积压的未读邮件,避免无谓 fetch 旧邮件:
+      既省流量,也避免旧邮件 fetch 失败产生报错。
     - 使用 BODY.PEEK[] 抓取:不会像 RFC822/BODY[] 那样隐式设置 \\Seen,
       保证"过滤跳过的邮件保持未读、推送成功才标记已读"的设计成立。
-    - 返回 [{'uid': .., 'raw_email': ..}]。
-    - 连接异常(select/search/fetch 失败)时抛错,由调用方判定重连。
+    - 返回 (raw_emails, failed_uids):
+        raw_emails: [{'uid':.., 'raw_email':..}] 成功拉取的邮件
+        failed_uids: [uid, ...] 单封 fetch 失败的 UID,由调用方跨轮计数,
+                     达到上限后标记已读放弃,避免同一封邮件无限重试
+    - 连续多封 fetch 失败视为连接异常,抛错由调用方触发重连。
     """
     typ, data = mail.select(config['mailbox'])
     if typ != 'OK':
         raise Exception(f"SELECT 失败: {data}")
 
-    typ, data = mail.uid('search', None, 'UNSEEN')
+    # 只搜索最近 block_before 秒内的未读邮件(SINCE 按邮件 Date 头过滤)
+    criteria = ['UNSEEN']
+    block_before = config.get('block_before')
+    if block_before:
+        since = (datetime.now(BJ_TZ) - timedelta(seconds=block_before)).strftime('%d-%b-%Y')
+        criteria += ['SINCE', since]
+
+    typ, data = mail.uid('search', None, *criteria)
     if typ != 'OK':
         raise Exception(f"SEARCH 失败: {data}")
 
     uid_list = data[0].split()
     if not uid_list:
-        return []
+        return [], []
 
     if limit and limit > 0:
         uid_list = uid_list[:limit]
@@ -262,11 +275,20 @@ def imap_fetch_unseen(config, mail, limit=None):
         print(f"[{config['imap_user']}] Found {len(uid_list)} unseen emails")
 
     raw_emails = []
+    failed_uids = []
+    consecutive_fetch_failures = 0  # 连续 fetch 失败计数,超过阈值视为连接异常
     for uid in uid_list:
         typ, msg_data = mail.uid('fetch', uid, '(BODY.PEEK[])')
         if typ != 'OK':
-            print(f"[{config['imap_user']}] 获取 UID {uid.decode()} 失败，跳过")
+            if config['debug']:
+                print(f"[{config['imap_user']}] 获取 UID {uid.decode()} 失败，跳过")
+            consecutive_fetch_failures += 1
+            failed_uids.append(uid.decode())
+            # 连续多封失败更可能是连接已损坏而非单封问题,主动抛错让调用方重连
+            if consecutive_fetch_failures >= 3:
+                raise Exception(f"连续 {consecutive_fetch_failures} 个 UID fetch 失败,连接可能已异常,触发重连")
             continue
+        consecutive_fetch_failures = 0  # 成功时重置计数,容忍单封偶发失败
         raw_email = None
         for response_part in msg_data:
             if isinstance(response_part, tuple):
@@ -275,7 +297,7 @@ def imap_fetch_unseen(config, mail, limit=None):
         if raw_email:
             raw_emails.append({'uid': uid.decode(), 'raw_email': raw_email})
 
-    return raw_emails
+    return raw_emails, failed_uids
 
 def send_to_feishu(config, subject, from_addr, date_str, body_preview, attachments=None):
     webhook = config['feishu_webhook']
@@ -373,7 +395,21 @@ def monitor_account(config):
 
             if config['debug']:
                 print(f"[{now_bj().strftime('%H:%M:%S')}] [{imap_user}] 检查邮件...")
-            raw_emails = imap_fetch_unseen(config, mail, limit=config['max_emails_per_run'])
+            raw_emails, failed_uids = imap_fetch_unseen(config, mail, limit=config['max_emails_per_run'])
+
+            # 单封 fetch 失败的 UID:跨轮计数,达到上限后标记已读放弃,避免同一封无限重试
+            for uid in failed_uids:
+                failed_count[uid] = failed_count.get(uid, 0) + 1
+                if failed_count[uid] >= max_retries:
+                    print(f"[{imap_user}] ⏭️  UID {uid} fetch 连续失败 {max_retries} 次,标记已读放弃(避免反复重试)")
+                    try:
+                        mail.uid('store', uid, '+FLAGS', '\\Seen')
+                    except Exception:
+                        pass
+                    failed_count.pop(uid, None)
+                else:
+                    print(f"[{imap_user}] ⚠️  UID {uid} fetch 失败(第 {failed_count[uid]}/{max_retries} 次),保持未读待重试")
+
             if raw_emails:
                 # 有新邮件才打印,无新邮件保持静默,避免每轮刷屏
                 print(f"[{now_bj().strftime('%H:%M:%S')}] [{imap_user}] 📬 获取到 {len(raw_emails)} 封未读邮件")
