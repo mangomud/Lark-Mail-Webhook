@@ -313,7 +313,7 @@ def send_to_feishu(config, subject, from_addr, date_str, body_preview, attachmen
         f"**📝 主题：** {subject}\n"
         f"**🕐 时间：** {date_str}\n"
         f"{attach_line}"
-        f"**📄 正文预览：**\n```\n{body_preview}\n```"
+        f"**📄 正文预览：**\n{body_preview}"
     )
     card = {
         "config": {"wide_screen_mode": True, "enable_forward": True},
