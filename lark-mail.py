@@ -23,6 +23,7 @@ DEFAULTS = {
     'batch_delay': 2.0,
     'poll_interval': 60,
     'blocked_keywords': '',
+    'blocked_senders': '',           # 屏蔽发件人,逗号分隔,匹配 From 头(不区分大小写)
     'max_retries': 3,                # 推送失败的最大重试次数,超限后标记已读放弃
     'reconnect_interval': 600,       # 连接复用:每 600 秒(10 分钟)强制重连一次,降低被服务器风控概率
     'debug': False,
@@ -95,6 +96,7 @@ def load_accounts():
     cfg['batch_delay'] = float(os.getenv('BATCH_DELAY', cfg['batch_delay']))
     cfg['poll_interval'] = int(os.getenv('POLL_INTERVAL', cfg['poll_interval']))
     cfg['blocked_keywords'] = os.getenv('BLOCKED_KEYWORDS', '')
+    cfg['blocked_senders'] = os.getenv('BLOCKED_SENDERS', '')
     cfg['max_retries'] = int(os.getenv('MAX_RETRIES', cfg['max_retries']))
     cfg['reconnect_interval'] = int(os.getenv('RECONNECT_INTERVAL', cfg['reconnect_interval']))
     cfg['debug'] = os.getenv('DEBUG', 'false').lower() == 'true'
@@ -313,7 +315,7 @@ def send_to_feishu(config, subject, from_addr, date_str, body_preview, attachmen
         f"**📝 主题：** {subject}\n"
         f"**🕐 时间：** {date_str}\n"
         f"{attach_line}"
-        f"**📄 正文预览：**\n{body_preview}"
+        f"**📄 正文预览：**\n```\n{body_preview}\n```"
     )
     card = {
         "config": {"wide_screen_mode": True, "enable_forward": True},
@@ -359,7 +361,13 @@ def send_to_feishu(config, subject, from_addr, date_str, body_preview, attachmen
 
 def monitor_account(config):
     imap_user = config['imap_user']
-    blocked_keywords = [kw.strip().lower() for kw in config['blocked_keywords'].split(',') if kw.strip()]
+    # 屏蔽词:支持中英文逗号分隔;去除首尾半角/全角空格;匹配不区分大小写
+    # 保留原始大小写用于日志显示,匹配时统一转小写
+    raw_keywords = [kw.strip(' \u3000') for kw in re.split(r'[,，]', config['blocked_keywords']) if kw.strip(' \u3000')]
+    blocked_keywords = [kw.lower() for kw in raw_keywords]
+    # 屏蔽发件人:同样的分词与大小写规则,匹配邮件 From 头
+    raw_senders = [s.strip(' \u3000') for s in re.split(r'[,，]', config['blocked_senders']) if s.strip(' \u3000')]
+    blocked_senders = [s.lower() for s in raw_senders]
     max_retries = config['max_retries']
     reconnect_interval = config['reconnect_interval']
     failed_count = {}  # uid -> 连续推送失败次数(内存计数,进程重启后清零)
@@ -370,7 +378,8 @@ def monitor_account(config):
     print(f"   跳过 {config['block_before'] // 3600} 小时前的邮件")
     print(f"   每次最多处理: {config['max_emails_per_run']} 封")
     print(f"   推送失败重试上限: {max_retries} 次(超限后标记已读放弃)")
-    print(f"   屏蔽词: {', '.join(blocked_keywords) if blocked_keywords else '无'}")
+    print(f"   屏蔽词: {', '.join(raw_keywords) if raw_keywords else '无'}(不区分大小写)")
+    print(f"   屏蔽发件人: {', '.join(raw_senders) if raw_senders else '无'}(不区分大小写)")
     print("-" * 50)
 
     mail = None
@@ -443,6 +452,11 @@ def monitor_account(config):
                         # 屏蔽词过滤：不推送，不标记已读
                         if contains_blocked_keyword(subject, blocked_keywords) or contains_blocked_keyword(body, blocked_keywords):
                             print(f"[{imap_user}] 🚫 命中屏蔽词（保持未读）: {subject}")
+                            continue
+
+                        # 发件人屏蔽过滤：不推送，不标记已读
+                        if contains_blocked_keyword(from_addr, blocked_senders):
+                            print(f"[{imap_user}] 🚫 命中发件人屏蔽（保持未读）: {from_addr} / {subject}")
                             continue
 
                         # 推送重试已达上限:标记已读放弃,避免每轮反复重试
