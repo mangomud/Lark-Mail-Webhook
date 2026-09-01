@@ -22,7 +22,8 @@ services:
       - IMAP_USER=${IMAP_USER:-}                  # 邮箱账号(单账户模式必填)
       - IMAP_PASS=${IMAP_PASS:-}                  # 授权码,不是登录密码!(单账户模式必填)
       - FEISHU_WEBHOOKS=${FEISHU_WEBHOOKS:-}      # 飞书机器人 Webhook 地址(单账户模式必填)
-      - BLOCKED_KEYWORDS=${BLOCKED_KEYWORDS:-}    # 屏蔽词,逗号分隔(可选)
+      - BLOCKED_KEYWORDS=${BLOCKED_KEYWORDS:-}    # 屏蔽词,中英文逗号分隔,命中主题/正文则跳过(可选)
+      - BLOCKED_SENDERS=${BLOCKED_SENDERS:-}      # 屏蔽发件人,中英文逗号分隔,匹配From头(可选)
 
       # ---- 多账户模式(推荐,可同时监控多个邮箱)----
       # 设置 MAIL_ACCOUNTS_JSON 后,脚本【优先】使用它,上面的单账户变量被忽略。
@@ -30,7 +31,8 @@ services:
       #   imap_user          邮箱账号(必填)
       #   imap_pass          授权码,不是登录密码(必填)
       #   feishu_webhook     飞书机器人 Webhook 地址(必填)
-      #   blocked_keywords   屏蔽词,逗号分隔;命中主题/正文则跳过(可选)
+      #   blocked_keywords   屏蔽词,中英文逗号分隔;命中主题/正文则跳过(可选)
+      #   blocked_senders    屏蔽发件人,中英文逗号分隔;命中From头则跳过(可选)
       #   max_retries        推送失败重试上限(可选,默认 3,超限后标记已读放弃)
       #   reconnect_interval 连接复用强制重连间隔秒数(可选,默认 600)
       #
