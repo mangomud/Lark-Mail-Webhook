@@ -202,6 +202,30 @@ def contains_blocked_keyword(text, blocked_keywords):
     text_lower = text.lower()
     return any(kw in text_lower for kw in blocked_keywords)
 
+# ---------- 跨线程推送去重(所有账户线程共享) ----------
+_pushed_ids = {}              # 邮件标识(Message-ID 或指纹) -> 推送时间戳
+_pushed_lock = threading.Lock()
+
+def _try_mark_pushed(mail_key):
+    """尝试占位:返回 False 表示该邮件已推送过(重复),返回 True 表示占位成功可推送"""
+    with _pushed_lock:
+        if mail_key in _pushed_ids:
+            return False
+        _pushed_ids[mail_key] = time.time()
+        return True
+
+def _unmark_pushed(mail_key):
+    """推送失败时移除占位,允许下轮重试"""
+    with _pushed_lock:
+        _pushed_ids.pop(mail_key, None)
+
+def _cleanup_pushed():
+    """清理 7 天前的旧记录,防止内存无限增长"""
+    with _pushed_lock:
+        cutoff = time.time() - 7 * 86400
+        for k in [k for k, v in _pushed_ids.items() if v < cutoff]:
+            _pushed_ids.pop(k, None)
+
 # ---------- IMAP 连接管理(连接复用) ----------
 def _safe_logout(mail):
     """安全登出 IMAP 连接,忽略异常"""
@@ -339,6 +363,11 @@ def send_to_feishu(config, subject, from_addr, date_str, body_preview, attachmen
         resp.raise_for_status()
         print(f"[{config['imap_user']}] ✅ 已推送邮件: {subject}")
         return True
+    except requests.exceptions.ReadTimeout as e:
+        # 读取超时:请求已发出,飞书大概率已收到卡片,
+        # 此时回退纯文本会造成同一条消息双发,故按"已发送"处理
+        print(f"[{config['imap_user']}] ⚠️  卡片消息响应超时(为避免重复不再回退纯文本,视作已发送): {e}")
+        return True
     except Exception as e:
         print(f"[{config['imap_user']}] ❌ 卡片消息发送失败，尝试纯文本: {e}")
         text_content = (
@@ -459,6 +488,20 @@ def monitor_account(config):
                             print(f"[{imap_user}] 🚫 命中发件人屏蔽（保持未读）: {from_addr} / {subject}")
                             continue
 
+                        # 邮件唯一标识:优先 Message-ID,缺失时用 发件人+主题+原始Date头 指纹
+                        message_id = (msg.get('Message-ID') or '').strip()
+                        mail_key = message_id or f'{from_addr}|{subject}|{raw_date}'
+
+                        # 去重占位:已推送过的邮件跳过重复推送,并顺手补标记已读
+                        # (防止"推送成功但 store 标记已读失败"或同邮箱多账户导致的重推)
+                        if not _try_mark_pushed(mail_key):
+                            print(f"[{imap_user}] ⏭️  该邮件已推送过,跳过重复推送: {subject}")
+                            try:
+                                mail.uid('store', uid, '+FLAGS', '\\Seen')
+                            except Exception:
+                                pass
+                            continue
+
                         # 推送重试已达上限:标记已读放弃,避免每轮反复重试
                         if failed_count.get(uid, 0) >= max_retries:
                             print(f"[{imap_user}] ⏭️  推送重试已达上限({max_retries} 次),标记已读放弃: {subject}")
@@ -471,9 +514,12 @@ def monitor_account(config):
                         push_success = send_to_feishu(config, subject, from_addr, formatted_date, body_preview, attachments)
 
                         if push_success:
+                            _cleanup_pushed()
                             mail.uid('store', uid, '+FLAGS', '\\Seen')
                             failed_count.pop(uid, None)
                         else:
+                            # 推送失败:移除去重占位,允许下轮重试
+                            _unmark_pushed(mail_key)
                             failed_count[uid] = failed_count.get(uid, 0) + 1
                             print(f"[{imap_user}] ⚠️  推送失败(第 {failed_count[uid]}/{max_retries} 次),邮件保持未读以便重试: {subject}")
 
