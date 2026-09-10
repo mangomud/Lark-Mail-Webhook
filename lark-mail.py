@@ -5,6 +5,7 @@ import json
 import email
 import imaplib
 import random
+import unicodedata
 import threading
 import requests
 from email.header import decode_header
@@ -196,11 +197,63 @@ def parse_email_date(date_str):
     except (ValueError, TypeError):
         return None
 
-def contains_blocked_keyword(text, blocked_keywords):
-    if not text or not blocked_keywords:
-        return False
-    text_lower = text.lower()
-    return any(kw in text_lower for kw in blocked_keywords)
+# 零宽字符/格式字符(BOM、零宽空格、零宽连接符等):不可见但会拆断子串匹配,
+# 垃圾邮件常用其拆字规避屏蔽,匹配前一律剔除
+_INVISIBLE_CHARS = {ord(c): None for c in '\u200b\u200c\u200d\u2060\ufeff'}
+
+def normalize_for_match(text):
+    """匹配前统一文本形态,保证屏蔽词与邮件内容在同一坐标系里比较:
+    - NFKC 归一化: 全角字母/数字/符号/空格 -> 半角(如 'ＡＢＣ１２３' -> 'abc123')
+    - casefold 折叠大小写: 比 lower() 更彻底(如德语 ß -> ss),中英文均适用
+    - 剔除零宽/格式字符: '免\\u200b费' 与 '免费' 视为相同,防拆字规避
+    - 剔除所有空白字符(含换行/NBSP/全角空格): 'no  reply' 与 'noreply'、
+      '免 费' 与 '免费' 视为相同,防空格拆字规避
+    屏蔽词与邮件文本两侧都走本函数,规则对称,不会出现单侧漏匹配。
+    """
+    if not text:
+        return ''
+    norm = unicodedata.normalize('NFKC', text).casefold()
+    return ''.join(norm.translate(_INVISIBLE_CHARS).split())
+
+def parse_blocked_items(raw_str):
+    """解析屏蔽词/屏蔽发件人配置,返回 [(原始词, 归一化词), ...]:
+    - 支持中英文逗号分隔
+    - 去除条目首尾所有空白(含换行/NBSP/全角空格,兼容多行 env 场景)
+    - 原始词仅用于日志显示,匹配一律用归一化词
+    - 归一化后为空的条目丢弃,避免空串子串匹配命中所有邮件
+    - 归一化后相同的条目去重(如 'OFFER'/'offer'/'ＯＦＦＥＲ' 只留一条),
+      避免冗余匹配和启动日志条数虚高
+    """
+    items = []
+    seen = set()
+    for raw in re.split(r'[,，]', raw_str or ''):
+        raw = raw.strip()
+        if not raw:
+            continue
+        norm = normalize_for_match(raw)
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        items.append((raw, norm))
+    return items
+
+def match_blocked_keyword(text, blocked_items):
+    """判断文本是否命中屏蔽词/屏蔽发件人。
+
+    blocked_items: parse_blocked_items 的返回值 [(原始词, 归一化词), ...]
+    文本与屏蔽词两侧都做 NFKC+casefold 归一化后再做子串匹配,
+    任何一侧存在大小写/全角半角差异都不会漏匹配。
+    返回命中的原始屏蔽词(用于日志定位是哪条规则),未命中返回 None。
+    """
+    if not text or not blocked_items:
+        return None
+    text_norm = normalize_for_match(text)
+    if not text_norm:
+        return None
+    for raw, norm in blocked_items:
+        if norm in text_norm:
+            return raw
+    return None
 
 # ---------- 跨线程推送去重(所有账户线程共享) ----------
 _pushed_ids = {}              # 邮件标识(Message-ID 或指纹) -> 推送时间戳
@@ -225,6 +278,23 @@ def _cleanup_pushed():
         cutoff = time.time() - 7 * 86400
         for k in [k for k, v in _pushed_ids.items() if v < cutoff]:
             _pushed_ids.pop(k, None)
+
+# ---------- 屏蔽邮件本地记忆(命中屏蔽词/发件人的邮件保持未读,
+# 但本地记一笔,下轮在拉取阶段直接跳过,避免每轮重复下载正文+重复打日志+挤占抓取额度) ----------
+_blocked_mails = {}           # f"{imap_user}|{mailbox}|{uidvalidity}|{uid}" -> 记录时间戳
+_blocked_lock = threading.Lock()
+
+def _remember_blocked_mail(mail_key):
+    """记录一封已判定为屏蔽的邮件(按 UID 维度,进程内存活)"""
+    with _blocked_lock:
+        _blocked_mails[mail_key] = time.time()
+
+def _cleanup_blocked(block_before):
+    """清理超过 block_before 窗口的记录:超窗后 SEARCH 的 SINCE 条件本就搜不到,记录可回收"""
+    cutoff = time.time() - block_before - 3600
+    with _blocked_lock:
+        for k in [k for k, v in _blocked_mails.items() if v < cutoff]:
+            _blocked_mails.pop(k, None)
 
 # ---------- IMAP 连接管理(连接复用) ----------
 def _safe_logout(mail):
@@ -269,15 +339,24 @@ def imap_fetch_unseen(config, mail, limit=None):
       既省流量,也避免旧邮件 fetch 失败产生报错。
     - 使用 BODY.PEEK[] 抓取:不会像 RFC822/BODY[] 那样隐式设置 \\Seen,
       保证"过滤跳过的邮件保持未读、推送成功才标记已读"的设计成立。
-    - 返回 (raw_emails, failed_uids):
+    - 本地已记录的屏蔽邮件(命中屏蔽词/发件人)在下轮直接跳过,不重复 fetch;
+      且在套用 limit 之前剔除,避免屏蔽邮件积压时挤占每轮抓取额度。
+      邮件保持未读,仅本地不再重复处理。
+    - 返回 (raw_emails, failed_uids, uidvalidity):
         raw_emails: [{'uid':.., 'raw_email':..}] 成功拉取的邮件
         failed_uids: [uid, ...] 单封 fetch 失败的 UID,由调用方跨轮计数,
                      达到上限后标记已读放弃,避免同一封邮件无限重试
+        uidvalidity: 本次 SELECT 的 UIDVALIDITY(供调用方构造屏蔽记录键)
     - 连续多封 fetch 失败视为连接异常,抛错由调用方触发重连。
     """
     typ, data = mail.select(config['mailbox'])
     if typ != 'OK':
         raise Exception(f"SELECT 失败: {data}")
+
+    # UIDVALIDITY 只能取一次(imaplib 取后即清除),取到后同时用于过滤和返回
+    resp = mail.response('UIDVALIDITY')
+    uidvalidity = resp[1][0].decode() if resp and resp[1] else '0'
+    blocked_prefix = f"{config['imap_user']}|{config['mailbox']}|{uidvalidity}"
 
     # 只搜索最近 block_before 秒内的未读邮件(SINCE 按邮件 Date 头过滤)
     criteria = ['UNSEEN']
@@ -292,10 +371,34 @@ def imap_fetch_unseen(config, mail, limit=None):
 
     uid_list = data[0].split()
     if not uid_list:
-        return [], []
+        return [], [], uidvalidity
 
+    if config['debug']:
+        window_desc = f",SINCE {since}" if block_before else ""
+        print(f"[{config['imap_user']}] SEARCH 到 {len(uid_list)} 封未读邮件{window_desc}")
+
+    # 先剔除本地已记录的屏蔽邮件,再套用 limit:屏蔽邮件不占抓取名额
+    skipped_blocked = 0
+    pending_uids = []
+    for u in uid_list:
+        if f"{blocked_prefix}|{u.decode()}" in _blocked_mails:
+            skipped_blocked += 1
+            continue
+        pending_uids.append(u)
+    uid_list = pending_uids
+    if skipped_blocked:
+        print(f"[{config['imap_user']}] ⏭️  跳过 {skipped_blocked} 封已知屏蔽邮件(保持未读,不占抓取额度)")
+
+    if not uid_list:
+        return [], [], uidvalidity
+
+    fetch_count = 0
     if limit and limit > 0:
+        fetch_count = min(len(uid_list), limit)
         uid_list = uid_list[:limit]
+    else:
+        fetch_count = len(uid_list)
+    print(f"[{config['imap_user']}] 📩 实际拉取 {fetch_count} 封未读邮件进行过滤判断")
 
     if config['debug']:
         print(f"[{config['imap_user']}] Found {len(uid_list)} unseen emails")
@@ -323,7 +426,7 @@ def imap_fetch_unseen(config, mail, limit=None):
         if raw_email:
             raw_emails.append({'uid': uid.decode(), 'raw_email': raw_email})
 
-    return raw_emails, failed_uids
+    return raw_emails, failed_uids, uidvalidity
 
 def send_to_feishu(config, subject, from_addr, date_str, body_preview, attachments=None):
     webhook = config['feishu_webhook']
@@ -390,13 +493,13 @@ def send_to_feishu(config, subject, from_addr, date_str, body_preview, attachmen
 
 def monitor_account(config):
     imap_user = config['imap_user']
-    # 屏蔽词:支持中英文逗号分隔;去除首尾半角/全角空格;匹配不区分大小写
-    # 保留原始大小写用于日志显示,匹配时统一转小写
-    raw_keywords = [kw.strip(' \u3000') for kw in re.split(r'[,，]', config['blocked_keywords']) if kw.strip(' \u3000')]
-    blocked_keywords = [kw.lower() for kw in raw_keywords]
-    # 屏蔽发件人:同样的分词与大小写规则,匹配邮件 From 头
-    raw_senders = [s.strip(' \u3000') for s in re.split(r'[,，]', config['blocked_senders']) if s.strip(' \u3000')]
-    blocked_senders = [s.lower() for s in raw_senders]
+    # 屏蔽词/屏蔽发件人: 支持中英文逗号分隔;
+    # 匹配前两侧统一做 NFKC 归一化(全角->半角)+casefold 折叠,
+    # 大小写/全角半角差异都不会漏匹配; 原始词保留用于日志显示
+    blocked_keywords = parse_blocked_items(config['blocked_keywords'])
+    blocked_senders = parse_blocked_items(config['blocked_senders'])
+    kw_display = ', '.join(kw for kw, _ in blocked_keywords)
+    sender_display = ', '.join(s for s, _ in blocked_senders)
     max_retries = config['max_retries']
     reconnect_interval = config['reconnect_interval']
     failed_count = {}  # uid -> 连续推送失败次数(内存计数,进程重启后清零)
@@ -407,8 +510,10 @@ def monitor_account(config):
     print(f"   跳过 {config['block_before'] // 3600} 小时前的邮件")
     print(f"   每次最多处理: {config['max_emails_per_run']} 封")
     print(f"   推送失败重试上限: {max_retries} 次(超限后标记已读放弃)")
-    print(f"   屏蔽词: {', '.join(raw_keywords) if raw_keywords else '无'}(不区分大小写)")
-    print(f"   屏蔽发件人: {', '.join(raw_senders) if raw_senders else '无'}(不区分大小写)")
+    print(f"   屏蔽词({len(blocked_keywords)} 条): {kw_display if kw_display else '无'}(忽略大小写/全半角/空白/零宽字符差异,匹配主题和正文)")
+    print(f"   屏蔽发件人({len(blocked_senders)} 条): {sender_display if sender_display else '无'}(同上规则,匹配 From 头)")
+    if blocked_keywords:
+        print(f"   屏蔽词命中后: 不推送、保持未读、本地记录后不再重复处理")
     print("-" * 50)
 
     mail = None
@@ -433,7 +538,9 @@ def monitor_account(config):
 
             if config['debug']:
                 print(f"[{now_bj().strftime('%H:%M:%S')}] [{imap_user}] 检查邮件...")
-            raw_emails, failed_uids = imap_fetch_unseen(config, mail, limit=config['max_emails_per_run'])
+            _cleanup_blocked(config['block_before'])
+            raw_emails, failed_uids, uidvalidity = imap_fetch_unseen(config, mail, limit=config['max_emails_per_run'])
+            blocked_prefix = f"{imap_user}|{config['mailbox']}|{uidvalidity}"
 
             # 单封 fetch 失败的 UID:跨轮计数,达到上限后标记已读放弃,避免同一封无限重试
             for uid in failed_uids:
@@ -478,14 +585,21 @@ def monitor_account(config):
                             print(f"[{imap_user}] ⏭️  跳过旧邮件（保持未读）: {subject}")
                             continue
 
-                        # 屏蔽词过滤：不推送，不标记已读
-                        if contains_blocked_keyword(subject, blocked_keywords) or contains_blocked_keyword(body, blocked_keywords):
-                            print(f"[{imap_user}] 🚫 命中屏蔽词（保持未读）: {subject}")
+                        # 屏蔽词过滤:主题/正文分别匹配,日志记录命中的规则与位置,便于排查
+                        hit_subject = match_blocked_keyword(subject, blocked_keywords)
+                        hit_body = None if hit_subject else match_blocked_keyword(body, blocked_keywords)
+                        if hit_subject or hit_body:
+                            hit_kw = hit_subject or hit_body
+                            hit_where = '主题' if hit_subject else '正文'
+                            print(f"[{imap_user}] 🚫 命中屏蔽词[{hit_where}] 规则: {hit_kw} | 保持未读,后续轮次不再处理 | {subject}")
+                            _remember_blocked_mail(f"{blocked_prefix}|{uid}")
                             continue
 
-                        # 发件人屏蔽过滤：不推送，不标记已读
-                        if contains_blocked_keyword(from_addr, blocked_senders):
-                            print(f"[{imap_user}] 🚫 命中发件人屏蔽（保持未读）: {from_addr} / {subject}")
+                        # 发件人屏蔽过滤:日志记录命中的规则
+                        hit_sender = match_blocked_keyword(from_addr, blocked_senders)
+                        if hit_sender:
+                            print(f"[{imap_user}] 🚫 命中发件人屏蔽 规则: {hit_sender} | 保持未读,后续轮次不再处理 | {from_addr} / {subject}")
+                            _remember_blocked_mail(f"{blocked_prefix}|{uid}")
                             continue
 
                         # 邮件唯一标识:优先 Message-ID,缺失时用 发件人+主题+原始Date头 指纹
