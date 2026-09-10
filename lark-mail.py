@@ -283,10 +283,18 @@ def _cleanup_pushed():
 # 但本地记一笔,下轮在拉取阶段直接跳过,避免每轮重复下载正文+重复打日志+挤占抓取额度) ----------
 _blocked_mails = {}           # f"{imap_user}|{mailbox}|{uidvalidity}|{uid}" -> 记录时间戳
 _blocked_lock = threading.Lock()
+# 记录数硬上限:正常场景下时间窗口清理已足够(默认 25 小时窗口,个人邮箱几十条);
+# 该上限仅防御极端配置(超大 BLOCK_BEFORE + 垃圾邮件洪峰)导致内存无界增长,
+# 10 万条约 13MB,触顶后淘汰最旧的 10% 腾出空间
+_BLOCKED_MEMO_MAX = 100000
 
 def _remember_blocked_mail(mail_key):
     """记录一封已判定为屏蔽的邮件(按 UID 维度,进程内存活)"""
     with _blocked_lock:
+        if len(_blocked_mails) >= _BLOCKED_MEMO_MAX:
+            oldest = sorted(_blocked_mails.items(), key=lambda kv: kv[1])[:_BLOCKED_MEMO_MAX // 10]
+            for k, _ in oldest:
+                _blocked_mails.pop(k, None)
         _blocked_mails[mail_key] = time.time()
 
 def _cleanup_blocked(block_before):
