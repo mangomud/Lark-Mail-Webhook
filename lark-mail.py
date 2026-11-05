@@ -3,6 +3,7 @@ import re
 import time
 import json
 import email
+import shutil
 import imaplib
 import random
 import unicodedata
@@ -25,10 +26,17 @@ DEFAULTS = {
     'poll_interval': 60,
     'blocked_keywords': '',
     'blocked_senders': '',           # 屏蔽发件人,逗号分隔,匹配 From 头(不区分大小写)
-    'max_retries': 3,                # 推送失败的最大重试次数,超限后标记已读放弃
+    'max_retries': 3,                # 推送失败的最大重试次数,超限后标记放弃
     'reconnect_interval': 600,       # 连接复用:每 600 秒(10 分钟)强制重连一次,降低被服务器风控概率
+    'push_mode': 'watermark',        # 默认: 纯本地水位线,完全不碰邮件(不改已读/已回复/不加关键字)
+    'mark_seen': False,              # 推送成功后【不】标已读
     'debug': False,
 }
+
+# ---------- 运行时数据文件路径(屏蔽词与水位线都放在同一目录) ----------
+# 容器部署时该目录由 docker-compose 挂载到宿主机 ./data,宿主机上可直接编辑
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+_UID_STATE_FILE = os.getenv('UID_STATE_FILE', '').strip() or os.path.join(_APP_DIR, 'uid_state.json')
 
 def now_bj():
     """当前北京时间(日志时间戳使用,避免容器 UTC 时区差异)"""
@@ -37,6 +45,10 @@ def now_bj():
 def load_accounts():
     """加载账户配置，优先解析 MAIL_ACCOUNTS_JSON，否则回退到单账户环境变量"""
     json_str = os.getenv('MAIL_ACCOUNTS_JSON', '').strip()
+    # 容忍"看起来像空"的各种写法: 单账户模式下这行常常被随手填成这些值,
+    # 直接丢给 json.loads 会报错,当成"未配置"处理更符合直觉。
+    if json_str.lower() in ('', 'null', 'none', '{}', '[]', '""', "''"):
+        json_str = ''
     if json_str:
         try:
             accounts = json.loads(json_str)
@@ -55,13 +67,17 @@ def load_accounts():
                     'poll_interval': 'POLL_INTERVAL',
                     'max_retries': 'MAX_RETRIES',
                     'reconnect_interval': 'RECONNECT_INTERVAL',
+                    'push_mode': 'PUSH_MODE',
+                    'mark_seen': 'MARK_SEEN',
                     'debug': 'DEBUG',
                 }
                 for key, env_var in env_map.items():
                     env_val = os.getenv(env_var)
                     if env_val is not None:
-                        if key == 'debug':
-                            cfg[key] = env_val.lower() == 'true'
+                        if key in ('debug', 'mark_seen'):
+                            cfg[key] = env_val.strip().lower() == 'true'
+                        elif key == 'push_mode':
+                            cfg[key] = env_val.strip().lower()
                         else:
                             cfg[key] = type(DEFAULTS[key])(env_val)
                 cfg.update(acc)
@@ -72,6 +88,9 @@ def load_accounts():
                 cfg['poll_interval'] = int(cfg['poll_interval'])
                 cfg['max_retries'] = int(cfg['max_retries'])
                 cfg['reconnect_interval'] = int(cfg['reconnect_interval'])
+                cfg['push_mode'] = str(cfg.get('push_mode') or 'watermark').strip().lower()
+                cfg['mark_seen'] = (cfg['mark_seen'] if isinstance(cfg['mark_seen'], bool)
+                                    else str(cfg['mark_seen']).strip().lower() == 'true')
                 cfg['debug'] = bool(cfg['debug']) if isinstance(cfg['debug'], bool) else str(cfg['debug']).lower() == 'true'
                 for r in ('imap_user', 'imap_pass', 'feishu_webhook'):
                     if r not in cfg or not cfg[r]:
@@ -79,7 +98,19 @@ def load_accounts():
                 merged_accounts.append(cfg)
             return merged_accounts
         except Exception as e:
-            print(f"❌ 解析 MAIL_ACCOUNTS_JSON 失败: {e}")
+            # 把值的样子打出来(只打开头,不泄露完整凭据),否则用户对着
+            # "Expecting value: line 1 column 1" 这种报错根本没法定位
+            preview = json_str[:80].replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
+            print("❌ 解析 MAIL_ACCOUNTS_JSON 失败")
+            print(f"   错误: {e}")
+            print(f"   值长度: {len(json_str)}")
+            print(f"   值开头: {preview!r}")
+            print("   常见原因:")
+            print("     1. JSON 被换行拆成多行(必须写成【一整行】)")
+            print("     2. 行首或行尾混入了 # 注释")
+            print("     3. 用了单引号,JSON 只认双引号")
+            print("     4. 只做单账户部署时,这一行应该留空")
+            print("   排查: docker inspect lark-mail --format '{{range .Config.Env}}{{println .}}{{end}}' | grep MAIL_ACCOUNTS_JSON")
             raise
 
     imap_user = os.getenv('IMAP_USER')
@@ -100,6 +131,8 @@ def load_accounts():
     cfg['blocked_senders'] = os.getenv('BLOCKED_SENDERS', '')
     cfg['max_retries'] = int(os.getenv('MAX_RETRIES', cfg['max_retries']))
     cfg['reconnect_interval'] = int(os.getenv('RECONNECT_INTERVAL', cfg['reconnect_interval']))
+    cfg['push_mode'] = os.getenv('PUSH_MODE', cfg['push_mode']).strip().lower()
+    cfg['mark_seen'] = os.getenv('MARK_SEEN', str(cfg['mark_seen'])).strip().lower() == 'true'
     cfg['debug'] = os.getenv('DEBUG', 'false').lower() == 'true'
     cfg['imap_user'] = imap_user
     cfg['imap_pass'] = imap_pass
@@ -273,11 +306,18 @@ def _unmark_pushed(mail_key):
         _pushed_ids.pop(mail_key, None)
 
 def _cleanup_pushed():
-    """清理 7 天前的旧记录,防止内存无限增长"""
+    """清理 7 天前的旧记录,防止内存无限增长。
+
+    返回本次清掉的条数。只在每轮轮询开始时调用一次(不是每封邮件都调),
+    这样即使一天几千封,也只是一天扫 1440 次,而不是几万次。
+    """
+    removed = 0
     with _pushed_lock:
         cutoff = time.time() - 7 * 86400
         for k in [k for k, v in _pushed_ids.items() if v < cutoff]:
             _pushed_ids.pop(k, None)
+            removed += 1
+    return removed
 
 # ---------- 屏蔽邮件本地记忆(命中屏蔽词/发件人的邮件保持未读,
 # 但本地记一笔,下轮在拉取阶段直接跳过,避免每轮重复下载正文+重复打日志+挤占抓取额度) ----------
@@ -304,6 +344,256 @@ def _cleanup_blocked(block_before):
         for k in [k for k, v in _blocked_mails.items() if v < cutoff]:
             _blocked_mails.pop(k, None)
 
+# ---------- "已推送"状态记录方式 ----------
+# 问题: \Seen 是【用户行为】,点开看一眼就置位。拿它当"处理过没有"的铁证,
+#       等于让别人随手一划就篡改你的状态机 —— 邮件被读过就永久漏推。
+#
+# 默认方案: watermark —— 状态只存在本地 uid_state.json,【完全不碰邮件】。
+#   不标已读、不标已回复、不加自定义关键字,连 STORE 命令都不发。
+#   容器里跑着但对邮箱是纯只读的,任何人用这个邮箱都不会察觉到异常。
+#   代价: 状态全在本地,data 卷必须挂载好;文件丢了就只能重扫(会跳过历史)。
+#
+# 下面两种模式会往邮件上写东西,只有明确需要时才用:
+#   keyword   : 自定义 IMAP keyword($LarkMailPushed)。客户端一般不显示,
+#               但确实改动了邮件,共用邮箱不建议。
+#   answered  : 标准 \Answered 位。Outlook/Foxmail 会显示"已回复",共用邮箱禁用。
+PUSH_MODE = os.getenv('PUSH_MODE', 'watermark').strip().lower()
+CUSTOM_PUSH_FLAG = '$LarkMailPushed'      # 仅 PUSH_MODE=keyword 时使用
+ANSWERED_FLAG = '\\Answered'              # 仅 PUSH_MODE=answered 时使用
+
+# 首次部署时,时间窗内的历史邮件超过这个数量就只建基线、不补推,
+# 免得第一次启动就把几十上百封旧邮件一次性推出去刷屏。
+# 少于等于这个数量则直接推(反正就几封,漏了更可惜)。
+FIRST_RUN_BASELINE_MIN = 5
+
+# ---------- UID 水位线(加速路径) ----------
+# UID 单调递增,记下已处理到的最大 UID 就能做增量,省掉每轮重复搜索。
+# keyword 模式下它只是加速,丢了还能靠服务端标记恢复;
+# watermark 模式下它就是唯一的正确性来源,所以必须持久化。
+_uid_state = {}          # "user|mailbox" -> {"uidvalidity": "...", "last_uid": 123}
+_uid_state_lock = threading.Lock()
+
+
+def probe_state_file():
+    """启动自检:验证状态文件所在目录可写。
+
+    水位线只是加速路径,写不进去也不会漏信(服务端标记兜底),
+    但写不进去意味着本地加速失效,还是值得提醒一句。
+    """
+    d = os.path.dirname(_UID_STATE_FILE) or '.'
+    try:
+        os.makedirs(d, exist_ok=True)
+        probe = _UID_STATE_FILE + '.probe'
+        with open(probe, 'w', encoding='utf-8') as f:
+            f.write('ok')
+        os.remove(probe)
+        return True
+    except Exception as e:
+        print("=" * 60)
+        print(f"⚠️  状态文件目录不可写: {d}  ({e})")
+        print("   影响: UID 水位线无法持久化,每次重启都会退回全量搜索。")
+        print("   但不会漏信 —— 服务端 \\Answered 标记才是权威状态。")
+        print("   排查: docker-compose.yml 是否挂载了  ./data:/data")
+        print("=" * 60)
+        return False
+
+
+def _read_state_file(path):
+    with open(path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError("内容不是 JSON 对象")
+    return data
+
+
+def load_uid_state():
+    """读取 UID 水位线。主文件缺失/损坏时尝试 .bak,都失败才按冷启动处理。"""
+    global _uid_state
+    print(f"📂 状态文件: {_UID_STATE_FILE}")
+    for path, label in ((_UID_STATE_FILE, ''), (_UID_STATE_FILE + '.bak', '(用备份恢复)')):
+        if not os.path.isfile(path):
+            continue
+        try:
+            data = _read_state_file(path)
+        except Exception as e:
+            print(f"⚠️  状态文件读取失败 {path}: {e}")
+            continue
+        _uid_state = data
+        print(f"💾 已恢复 {len(_uid_state)} 个邮箱文件夹的水位线{label} —— 重启后继续增量拉取")
+        return
+    if not os.path.isfile(_UID_STATE_FILE):
+        print("🆕 状态文件不存在: 首次运行,或 volume 没挂上")
+    _uid_state = {}
+
+
+def save_uid_state():
+    """原子写入水位线文件(先写 .tmp 再 os.replace,避免进程被杀时留下半个 JSON)。
+
+    watermark 模式下这个文件是【唯一】的状态来源,所以额外保留一份 .bak:
+    主文件万一写坏/被误删,还能从备份恢复,不至于整个重扫。
+    """
+    with _uid_state_lock:
+        snapshot = dict(_uid_state)
+    first_time = not os.path.isfile(_UID_STATE_FILE)
+    try:
+        d = os.path.dirname(_UID_STATE_FILE)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        tmp = _UID_STATE_FILE + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(snapshot, f, ensure_ascii=False, indent=2)
+        if os.path.isfile(_UID_STATE_FILE):
+            try:
+                shutil.copy2(_UID_STATE_FILE, _UID_STATE_FILE + '.bak')
+            except Exception:
+                pass
+        os.replace(tmp, _UID_STATE_FILE)
+        if first_time:
+            # 首次落盘时明确告知一声,方便确认挂载目录真的可写、文件真的建出来了
+            print(f"💾 已创建状态文件: {_UID_STATE_FILE}")
+    except Exception as e:
+        print(f"⚠️  水位线写入失败(不影响推送,但重启后会重复处理): {e}")
+
+
+def get_watermark(state_key):
+    """返回 (uidvalidity, last_uid);无记录时返回 (None, 0)"""
+    with _uid_state_lock:
+        st = _uid_state.get(state_key) or {}
+    return st.get('uidvalidity'), int(st.get('last_uid') or 0)
+
+
+def set_watermark(state_key, uidvalidity, last_uid):
+    with _uid_state_lock:
+        _uid_state[state_key] = {'uidvalidity': uidvalidity, 'last_uid': int(last_uid)}
+
+
+def probe_custom_flag(mail):
+    """探测服务器是否支持自定义 IMAP keyword。
+
+    做法: 拿窗口内最后一封邮件,打一个探针标记 → SEARCH KEYWORD 验证 → 立刻撤销。
+    无论结果如何都会撤销,绝不在用户的邮件上留痕。
+
+    返回 True / False;探测不了(空邮箱 / 连接异常)返回 None。
+    """
+    try:
+        typ, data = mail.uid('search', None, 'ALL')
+        if typ != 'OK' or not data or not data[0]:
+            return None                     # 空邮箱,没法探测
+        uid = data[0].split()[-1].decode()
+        probe = '$LarkProbe'
+        typ, _ = mail.uid('store', uid, '+FLAGS', probe)
+        if typ != 'OK':
+            return False
+        typ, d = mail.uid('search', None, 'KEYWORD', probe)
+        supported = typ == 'OK' and d and d[0] and uid.encode() in d[0].split()
+        try:
+            mail.uid('store', uid, '-FLAGS', probe)   # 必须撤销探针
+        except Exception:
+            pass
+        return bool(supported)
+    except Exception as e:
+        print(f"⚠️  自定义标记探测失败({e}),回退到本地水位线模式")
+        return None
+
+
+def resolve_push_mode(mail, config):
+    """确定本账户实际的推送状态记录方式。
+
+    默认 watermark —— 完全不碰邮件(不发任何 STORE)。
+    keyword / answered 必须显式配置;keyword 还会先验证服务器是否真支持,
+    不支持就自动退回 watermark,避免标记写不进去导致每轮重复推送。
+    """
+    mode = str(config.get('push_mode') or PUSH_MODE or 'watermark').strip().lower()
+    if mode == 'watermark':
+        return 'watermark'
+    if mode == 'answered':
+        return 'answered'          # 标准 flag,所有服务器都支持,无需探测
+    if mode == 'keyword':
+        try:
+            mail.select(config['mailbox'])      # SEARCH 需要先 SELECT
+        except Exception:
+            pass
+        if probe_custom_flag(mail):
+            return 'keyword'
+        print(f"[{config['imap_user']}] ⚠️  服务器不支持自定义 keyword,已退回 watermark(不碰邮件)")
+        return 'watermark'
+    print(f"[{config['imap_user']}] ⚠️  未知的 PUSH_MODE={mode},按 watermark 处理")
+    return 'watermark'
+
+
+PUSH_MODE_DESC = {
+    'watermark': '本地 UID 水位线(完全不碰邮件: 不改已读、不改已回复、不加关键字)',
+    'keyword': f'自定义 keyword {CUSTOM_PUSH_FLAG}(会改动邮件,共用邮箱不建议)',
+    'answered': '\\Answered(客户端会显示"已回复"箭头,共用邮箱禁用)',
+}
+
+
+def _search_uids(mail, since, mode='unpushed', push_mode='keyword'):
+    """按推送状态标记搜索 UID 集合。
+
+    mode: 'unpushed'(未推送) / 'pushed'(已推送) / 'all'(全部)
+    push_mode: keyword / answered / watermark
+    搜索失败不抛错,返回空集。
+    """
+    if push_mode == 'keyword':
+        criteria = {'unpushed': ['UNKEYWORD', CUSTOM_PUSH_FLAG],
+                    'pushed': ['KEYWORD', CUSTOM_PUSH_FLAG],
+                    'all': ['ALL']}[mode]
+    elif push_mode == 'answered':
+        criteria = {'unpushed': ['UNANSWERED'],
+                    'pushed': ['ANSWERED'],
+                    'all': ['ALL']}[mode]
+    else:
+        criteria = ['ALL']
+    if since:
+        criteria += ['SINCE', since]
+    typ, data = mail.uid('search', None, *criteria)
+    if typ != 'OK' or not data or not data[0]:
+        return set()
+    return {int(u) for u in data[0].split()}
+
+
+def _mark_pushed_flag(mail, uid, push_mode):
+    """把邮件标记为"已推送"。
+
+    keyword 模式写自定义 keyword,answered 模式写 \\Answered,
+    watermark 模式不碰邮件(只靠本地水位线)。
+    """
+    try:
+        if push_mode == 'keyword':
+            mail.uid('store', str(uid), '+FLAGS', CUSTOM_PUSH_FLAG)
+        elif push_mode == 'answered':
+            mail.uid('store', str(uid), '+FLAGS', ANSWERED_FLAG)
+        return True
+    except Exception:
+        return False
+
+
+def build_store_flags(push_mode, mark_seen):
+    """构造推送成功后要写的 flag 列表"""
+    flags = []
+    if mark_seen:
+        flags.append('\\Seen')
+    if push_mode == 'keyword':
+        flags.append(CUSTOM_PUSH_FLAG)
+    elif push_mode == 'answered':
+        flags.append(ANSWERED_FLAG)
+    if not flags:
+        return None                    # watermark + 不标已读 -> 什么都不用写
+    return flags[0] if len(flags) == 1 else '(' + ' '.join(flags) + ')'
+
+
+def _apply_push_state(mail, uid, push_mode, store_flags):
+    """按当前模式把"已推送"状态写到邮件上(watermark 模式不碰邮件)"""
+    try:
+        if store_flags:
+            mail.uid('store', str(uid), '+FLAGS', store_flags)
+        elif push_mode != 'watermark':
+            _mark_pushed_flag(mail, uid, push_mode)
+    except Exception:
+        pass
+
+
 # ---------- IMAP 连接管理(连接复用) ----------
 def _safe_logout(mail):
     """安全登出 IMAP 连接,忽略异常"""
@@ -312,6 +602,57 @@ def _safe_logout(mail):
             mail.logout()
         except Exception:
             pass
+
+# 常见邮箱服务商的默认 IMAP 地址,用于登录失败时做配置矛盾检查
+KNOWN_IMAP = {
+    '163.com': 'imap.163.com',
+    '126.com': 'imap.126.com',
+    'yeah.net': 'imap.yeah.net',
+    'qq.com': 'imap.qq.com',
+    'foxmail.com': 'imap.qq.com',
+    'gmail.com': 'imap.gmail.com',
+    'outlook.com': 'outlook.office365.com',
+    'hotmail.com': 'outlook.office365.com',
+    'live.com': 'outlook.office365.com',
+}
+
+
+def hint_imap_config(config):
+    """登录失败时把最常见的一类配置错误指出来。
+
+    最高频的坑: 用的是企业邮箱(如 @company.com),但 IMAP_SERVER 还留着默认的
+    imap.163.com。服务器当然回"用户名或密码错误" —— 它压根不认识这个账号。
+    光看这条错误,人很容易去怀疑授权码,来回折腾半天。
+    """
+    user = config.get('imap_user', '') or ''
+    server = (config.get('imap_server', '') or '').lower()
+    if '@' not in user:
+        return
+    domain = user.split('@')[-1].lower()
+
+    expected = KNOWN_IMAP.get(domain)
+    if expected:
+        ok = expected in server
+        advice = f"应该是 {expected}:993"
+    else:
+        # 企业邮箱(域名不在已知表里): 只要不是那个默认的 163 地址,就当用户已经改对了
+        ok = server != 'imap.163.com'
+        advice = ("企业邮箱需要填服务商自己的 IMAP 地址,常见的有:\n"
+                  "        腾讯企业邮 imap.exmail.qq.com:993\n"
+                  "        阿里企业邮 imap.qiye.aliyun.com:993\n"
+                  "        网易企业邮 imap.qiye.163.com:993  (注意不是 imap.163.com)\n"
+                  f"        查一下: dig +short MX {domain}")
+
+    if ok:
+        # 地址看着是对的,那问题多半在授权码
+        if '163' in server or '126' in server:
+            print(f"[{user}] 💡 如果反复这个错, 先确认 IMAP_PASS 填的是【授权码】而不是登录密码")
+        return
+
+    print(f"[{user}] 💡 配置对不上: 邮箱域名是 {domain}, 但 IMAP_SERVER 指向 {server}")
+    print(f"        {advice}")
+    print(f"        改完执行: docker compose up -d --force-recreate  (restart 不会重读 .env)")
+
 
 def imap_connect(config):
     """建立 IMAP SSL 连接并登录(发送 ID 命令模拟 Outlook 客户端)。
@@ -339,88 +680,158 @@ def imap_connect(config):
         print(f"[{config['imap_user']}] Login successful")
     return mail
 
-def imap_fetch_unseen(config, mail, limit=None):
-    """在已建立的连接上拉取未读邮件。
+def imap_fetch_new(config, mail, limit=None, retry_uids=None, push_mode='keyword'):
+    """拉取"还没推送过"的邮件,与已读/未读无关。
 
-    - 只在搜索阶段就限定最近 block_before 秒内的未读邮件(SEARCH ... SINCE),
-      从源头过滤远古积压的未读邮件,避免无谓 fetch 旧邮件:
-      既省流量,也避免旧邮件 fetch 失败产生报错。
-    - 使用 BODY.PEEK[] 抓取:不会像 RFC822/BODY[] 那样隐式设置 \\Seen,
-      保证"过滤跳过的邮件保持未读、推送成功才标记已读"的设计成立。
-    - 本地已记录的屏蔽邮件(命中屏蔽词/发件人)在下轮直接跳过,不重复 fetch;
-      且在套用 limit 之前剔除,避免屏蔽邮件积压时挤占每轮抓取额度。
-      邮件保持未读,仅本地不再重复处理。
-    - 返回 (raw_emails, failed_uids, uidvalidity):
-        raw_emails: [{'uid':.., 'raw_email':..}] 成功拉取的邮件
-        failed_uids: [uid, ...] 单封 fetch 失败的 UID,由调用方跨轮计数,
-                     达到上限后标记已读放弃,避免同一封邮件无限重试
-        uidvalidity: 本次 SELECT 的 UIDVALIDITY(供调用方构造屏蔽记录键)
-    - 连续多封 fetch 失败视为连接异常,抛错由调用方触发重连。
+    push_mode 决定用哪种状态记录方式:
+      keyword   : 服务端自定义 keyword,冷启动可靠恢复,不干扰共享邮箱
+      answered  : 服务端 \\Answered 位(兼容性最好,但共享邮箱有副作用)
+      watermark : 纯本地 UID 水位线,完全不碰邮件
+
+    搜索策略:
+      1. 常规增量: UID <水位线+1>:* —— 水位线之后的所有邮件,不区分已读未读。
+      2. 冷启动(首次部署 / 本地文件丢失 / UIDVALIDITY 变化):
+         keyword/answered 模式退回服务端标记全量搜索,已读的也能准确捞回来;
+         watermark 模式没标记可用,只能跳过历史(端上漏信风险最高的一种)。
+      3. 兜底(仅当 retry_uids 非空时): 再搜一次未推送的,捞回推送失败的。
+
+    - BODY.PEEK[] 抓取:不会隐式设置 \\Seen。
+    - 本地已记录的屏蔽邮件直接跳过,且在套 limit 之前剔除,避免挤占每轮抓取额度。
+    - 水位线只推进到"本轮真正 fetch 成功"的最大 UID:被 limit 截断或 fetch 失败的邮件
+      UID 仍在水位线之上,下轮还能被增量搜索捞到,不会因为额度限制漏水。
+
+    返回 (raw_emails, failed_uids, uidvalidity, state_key)
     """
     typ, data = mail.select(config['mailbox'])
     if typ != 'OK':
         raise Exception(f"SELECT 失败: {data}")
 
-    # UIDVALIDITY 只能取一次(imaplib 取后即清除),取到后同时用于过滤和返回
+    # UIDVALIDITY 只能取一次(imaplib 取后即清除)
     resp = mail.response('UIDVALIDITY')
     uidvalidity = resp[1][0].decode() if resp and resp[1] else '0'
-    blocked_prefix = f"{config['imap_user']}|{config['mailbox']}|{uidvalidity}"
+    state_key = f"{config['imap_user']}|{config['mailbox']}"
+    blocked_prefix = f"{state_key}|{uidvalidity}"
 
-    # 只搜索最近 block_before 秒内的未读邮件(SINCE 按邮件 Date 头过滤)
-    criteria = ['UNSEEN']
+    saved_vid, saved_uid = get_watermark(state_key)
+    cold_start = (saved_vid is None) or (saved_vid != uidvalidity)
+    watermark = 0 if cold_start else saved_uid
+
+    def _commit(final_uid):
+        """水位线只在真正推进或有变化时落盘,减少无谓 IO"""
+        if final_uid > saved_uid or saved_vid != uidvalidity:
+            set_watermark(state_key, uidvalidity, final_uid)
+            save_uid_state()
+
+    # 时间窗(SINCE 按邮件 Date 头过滤),从源头挡住远古积压
     block_before = config.get('block_before')
-    if block_before:
-        since = (datetime.now(BJ_TZ) - timedelta(seconds=block_before)).strftime('%d-%b-%Y')
-        criteria += ['SINCE', since]
+    since = (datetime.now(BJ_TZ) - timedelta(seconds=block_before)).strftime('%d-%b-%Y') if block_before else None
 
-    typ, data = mail.uid('search', None, *criteria)
-    if typ != 'OK':
-        raise Exception(f"SEARCH 失败: {data}")
+    candidate_uids = set()
+    baseline_ceiling = 0      # 冷启动时窗口内的最大 UID,用于"没有待推邮件"时直接推进水位线
 
-    uid_list = data[0].split()
-    if not uid_list:
-        return [], [], uidvalidity
+    if cold_start and push_mode == 'watermark':
+        # 纯本地模式: 服务端没有任何可用标记,只能靠"跨过历史"防刷屏。
+        # 代价必须说清楚 —— 本地水位线丢过时,期间到达且被人读过的邮件会漏。
+        # 所以默认优先 keyword,watermark 只是服务器不支持时的兜底。
+        all_uids = _search_uids(mail, since, 'all', push_mode)
+        watermark = max(all_uids) if all_uids else 0
+        baseline_ceiling = watermark
+        if all_uids:
+            print(f"[{config['imap_user']}] 🩹 冷启动(纯本地模式): 水位线起点设为 UID {watermark},"
+                  f"跳过 {len(all_uids)} 封历史邮件")
+            print(f"[{config['imap_user']}]    ⚠️  此模式依赖本地状态文件,若 data 卷丢失会漏掉期间已读的邮件")
+        _commit(watermark)
+        return [], [], uidvalidity, state_key
 
-    if config['debug']:
-        window_desc = f",SINCE {since}" if block_before else ""
-        print(f"[{config['imap_user']}] SEARCH 到 {len(uid_list)} 封未读邮件{window_desc}")
+    if cold_start:
+        # 本地水位线不可信。绝不能靠"直接把整个时间窗跨过去"来防刷屏 ——
+        # 那样会把停机期间到达、并且已经被人读过的邮件一并跨掉,正是要治的漏信。
+        # 改为问服务器: 窗口内哪些邮件还没打过推送标记?
+        all_uids = _search_uids(mail, since, 'all', push_mode)
+        unpushed_uids = _search_uids(mail, since, 'unpushed', push_mode)
 
-    # 先剔除本地已记录的屏蔽邮件,再套用 limit:屏蔽邮件不占抓取名额
+        if not all_uids:
+            if config['debug']:
+                print(f"[{config['imap_user']}] 冷启动: 时间窗内没有邮件")
+        elif (saved_vid is None and len(unpushed_uids) == len(all_uids)
+              and len(all_uids) > FIRST_RUN_BASELINE_MIN):
+            # 首次部署: 窗口内一封带标记的都没有,说明服务端也没有我们的历史记录。
+            # 这种情况全推会把一堆历史邮件一次性轰出去,先建立基线:
+            # 全部打上标记但不推送,之后新到的邮件正常推。
+            print(f"[{config['imap_user']}] 🆕 首次部署: 为时间窗内 {len(all_uids)} 封历史邮件建立基线(不推送)")
+            marked = sum(1 for u in sorted(all_uids) if _mark_pushed_flag(mail, u, push_mode))
+            watermark = max(all_uids)
+            _commit(watermark)
+            print(f"[{config['imap_user']}] ✅ 基线建立完成({marked}/{len(all_uids)} 封已标记),新到的邮件会正常推送")
+            return [], [], uidvalidity, state_key
+        else:
+            # 服务端有历史标记 → 说明只是本地状态丢了(重启/换机器/文件被删),
+            # 或者 UIDVALIDITY 变了。按"未推送"补推:
+            # **已经被人读过、但没推送过的邮件也会在这里被捞回来**,这就是要的效果。
+            candidate_uids = unpushed_uids
+            watermark = (min(all_uids) - 1) if all_uids else 0
+            baseline_ceiling = max(all_uids) if all_uids else 0
+            print(f"[{config['imap_user']}] 🩹 冷启动恢复: 服务端标记显示 {len(unpushed_uids)} 封未推送,"
+                  f"已列入候选(含被读过的)")
+    else:
+        # 常规增量:水位线之后的所有邮件,不区分已读
+        typ, data = mail.uid('search', None, 'UID', f'{watermark + 1}:*')
+        if typ != 'OK':
+            raise Exception(f"SEARCH 失败: {data}")
+        for u in (data[0].split() if data and data[0] else []):
+            uid_i = int(u)
+            # 坑: 'n:*' 在 n 大于邮箱当前最大 UID 时会退化成返回最大那封,必须再按水位线滤一次
+            if uid_i > watermark:
+                candidate_uids.add(uid_i)
+        if config['debug']:
+            print(f"[{config['imap_user']}] 增量搜索: 水位线 UID={watermark}, 新邮件 {len(candidate_uids)} 封")
+
+    # 兜底:仅在存在待重试的 UID 时才额外搜一次"未推送",捞回推送失败的邮件。
+    # 这里绝不能用 UNSEEN —— 推送失败期间邮件可能已经被同事点开读过,
+    # 用 UNSEEN 兜底会直接把这封漏掉。
+    # 正常无失败时跳过,否则每轮都要把历史未推送邮件重新 fetch 一遍,白烧流量。
+    if retry_uids and not cold_start and push_mode != 'watermark':
+        before = len(candidate_uids)
+        candidate_uids |= _search_uids(mail, since, 'unpushed', push_mode)
+        if len(candidate_uids) > before:
+            print(f"[{config['imap_user']}] 🔁 兜底捞回 {len(candidate_uids) - before} 封未推送邮件")
+
+    if not candidate_uids:
+        # 冷启动时窗口内可能一封待推的都没有(全被标记过)。
+        # 这时候必须把水位线推到窗口最大 UID,否则它会停在 0,
+        # 下一轮又变成"增量搜索 UID 1:*"把整个邮箱重新扫一遍。
+        _commit(max(watermark, baseline_ceiling))
+        return [], [], uidvalidity, state_key
+
+    # 先剔除本地已记录的屏蔽邮件,再套 limit:屏蔽邮件不占抓取名额
     skipped_blocked = 0
-    pending_uids = []
-    for u in uid_list:
-        if f"{blocked_prefix}|{u.decode()}" in _blocked_mails:
+    pending = []
+    for uid_i in sorted(candidate_uids):
+        if f"{blocked_prefix}|{uid_i}" in _blocked_mails:
             skipped_blocked += 1
             continue
-        pending_uids.append(u)
-    uid_list = pending_uids
+        pending.append(uid_i)
     if skipped_blocked:
         print(f"[{config['imap_user']}] ⏭️  跳过 {skipped_blocked} 封已知屏蔽邮件(保持未读,不占抓取额度)")
 
-    if not uid_list:
-        return [], [], uidvalidity
+    if not pending:
+        _commit(watermark)
+        return [], [], uidvalidity, state_key
 
-    fetch_count = 0
     if limit and limit > 0:
-        fetch_count = min(len(uid_list), limit)
-        uid_list = uid_list[:limit]
-    else:
-        fetch_count = len(uid_list)
-    print(f"[{config['imap_user']}] 📩 实际拉取 {fetch_count} 封未读邮件进行过滤判断")
-
-    if config['debug']:
-        print(f"[{config['imap_user']}] Found {len(uid_list)} unseen emails")
+        pending = pending[:limit]
+    print(f"[{config['imap_user']}] 📩 实际拉取 {len(pending)} 封邮件进行过滤判断")
 
     raw_emails = []
     failed_uids = []
     consecutive_fetch_failures = 0  # 连续 fetch 失败计数,超过阈值视为连接异常
-    for uid in uid_list:
-        typ, msg_data = mail.uid('fetch', uid, '(BODY.PEEK[])')
+    for uid_i in pending:
+        typ, msg_data = mail.uid('fetch', str(uid_i), '(BODY.PEEK[])')
         if typ != 'OK':
             if config['debug']:
-                print(f"[{config['imap_user']}] 获取 UID {uid.decode()} 失败，跳过")
+                print(f"[{config['imap_user']}] 获取 UID {uid_i} 失败，跳过")
             consecutive_fetch_failures += 1
-            failed_uids.append(uid.decode())
+            failed_uids.append(str(uid_i))
             # 连续多封失败更可能是连接已损坏而非单封问题,主动抛错让调用方重连
             if consecutive_fetch_failures >= 3:
                 raise Exception(f"连续 {consecutive_fetch_failures} 个 UID fetch 失败,连接可能已异常,触发重连")
@@ -432,9 +843,15 @@ def imap_fetch_unseen(config, mail, limit=None):
                 raw_email = response_part[1]
                 break
         if raw_email:
-            raw_emails.append({'uid': uid.decode(), 'raw_email': raw_email})
+            raw_emails.append({'uid': str(uid_i), 'raw_email': raw_email})
 
-    return raw_emails, failed_uids, uidvalidity
+    # 水位线推进到本轮成功 fetch 的最大 UID;被 limit 截断的、fetch 失败的都还在水位线之上,下轮可重来
+    final_uid = watermark
+    if raw_emails:
+        final_uid = max(final_uid, max(int(r['uid']) for r in raw_emails))
+    _commit(final_uid)
+
+    return raw_emails, failed_uids, uidvalidity, state_key
 
 def send_to_feishu(config, subject, from_addr, date_str, body_preview, attachments=None):
     webhook = config['feishu_webhook']
@@ -510,14 +927,18 @@ def monitor_account(config):
     sender_display = ', '.join(s for s, _ in blocked_senders)
     max_retries = config['max_retries']
     reconnect_interval = config['reconnect_interval']
+    mark_seen = config.get('mark_seen', True)
     failed_count = {}  # uid -> 连续推送失败次数(内存计数,进程重启后清零)
+    push_mode = None   # 连上服务器后探测确定
 
     print(f"🚀 启动监控账户: {imap_user}")
     print(f"   轮询间隔: {config['poll_interval']} 秒")
     print(f"   连接复用: 每 {reconnect_interval // 60} 分钟强制重连一次")
     print(f"   跳过 {config['block_before'] // 3600} 小时前的邮件")
     print(f"   每次最多处理: {config['max_emails_per_run']} 封")
-    print(f"   推送失败重试上限: {max_retries} 次(超限后标记已读放弃)")
+    print(f"   推送失败重试上限: {max_retries} 次(超限后标记放弃)")
+    print(f"   状态记录方式: {config.get('push_mode', 'watermark')}(watermark = 完全不碰邮件)")
+    print(f"   推送成功后标记已读: {'是' if mark_seen else '否(邮件保持原样)'}")
     print(f"   屏蔽词({len(blocked_keywords)} 条): {kw_display if kw_display else '无'}(忽略大小写/全半角/空白/零宽字符差异,匹配主题和正文)")
     print(f"   屏蔽发件人({len(blocked_senders)} 条): {sender_display if sender_display else '无'}(同上规则,匹配 From 头)")
     if blocked_keywords:
@@ -535,6 +956,10 @@ def monitor_account(config):
                 mail = imap_connect(config)
                 conn_errors = 0
                 last_connect_time = time.time()
+                # 连接建立后确定状态记录方式(只需一次)
+                if push_mode is None:
+                    push_mode = resolve_push_mode(mail, config)
+                    print(f"[{imap_user}] 📌 状态记录方式: {PUSH_MODE_DESC.get(push_mode, push_mode)}")
 
             # ---- 定时强制重连,避免长时间占用连接被服务器断开 ----
             if time.time() - last_connect_time > reconnect_interval:
@@ -546,17 +971,29 @@ def monitor_account(config):
 
             if config['debug']:
                 print(f"[{now_bj().strftime('%H:%M:%S')}] [{imap_user}] 检查邮件...")
-            _cleanup_blocked(config['block_before'])
-            raw_emails, failed_uids, uidvalidity = imap_fetch_unseen(config, mail, limit=config['max_emails_per_run'])
-            blocked_prefix = f"{imap_user}|{config['mailbox']}|{uidvalidity}"
 
-            # 单封 fetch 失败的 UID:跨轮计数,达到上限后标记已读放弃,避免同一封无限重试
+            _cleanup_blocked(config['block_before'])
+            # 去重记录每轮清一次即可(7 天窗口)。原来放在"每封推送成功"里,
+            # 一天几千封就要重复遍历几千遍,纯属浪费 CPU。
+            _cleanup_pushed()
+            # 推送成功后要写的 flag:已读(可选)+ 推送标记(按模式)
+            store_flags = build_store_flags(push_mode, mark_seen)
+            raw_emails, failed_uids, uidvalidity, state_key = imap_fetch_new(
+                config, mail, limit=config['max_emails_per_run'],
+                retry_uids=failed_count, push_mode=push_mode)
+            blocked_prefix = f"{state_key}|{uidvalidity}"
+
+            # 单封 fetch 失败的 UID:跨轮计数,达到上限后标记放弃,避免同一封无限重试
+            # (同时打推送标记:表示"这封不再处理",否则下一轮搜索又会把它捞回来)
             for uid in failed_uids:
                 failed_count[uid] = failed_count.get(uid, 0) + 1
                 if failed_count[uid] >= max_retries:
-                    print(f"[{imap_user}] ⏭️  UID {uid} fetch 连续失败 {max_retries} 次,标记已读放弃(避免反复重试)")
+                    print(f"[{imap_user}] ⏭️  UID {uid} fetch 连续失败 {max_retries} 次,标记放弃(避免反复重试)")
                     try:
-                        mail.uid('store', uid, '+FLAGS', '\\Seen')
+                        if store_flags:
+                            mail.uid('store', uid, '+FLAGS', store_flags)
+                        elif push_mode != 'watermark':
+                            _mark_pushed_flag(mail, uid, push_mode)
                     except Exception:
                         pass
                     failed_count.pop(uid, None)
@@ -565,7 +1002,7 @@ def monitor_account(config):
 
             if raw_emails:
                 # 有新邮件才打印,无新邮件保持静默,避免每轮刷屏
-                print(f"[{now_bj().strftime('%H:%M:%S')}] [{imap_user}] 📬 获取到 {len(raw_emails)} 封未读邮件")
+                print(f"[{now_bj().strftime('%H:%M:%S')}] [{imap_user}] 📬 获取到 {len(raw_emails)} 封新邮件")
                 cutoff_time = datetime.now(timezone.utc) - timedelta(seconds=config['block_before'])
 
                 for item in raw_emails:
@@ -588,7 +1025,7 @@ def monitor_account(config):
                         else:
                             formatted_date = raw_date
 
-                        # 时间过滤：不推送，不标记已读
+                        # 时间过滤：不推送，不写任何标记
                         if mail_date and mail_date < cutoff_time:
                             print(f"[{imap_user}] ⏭️  跳过旧邮件（保持未读）: {subject}")
                             continue
@@ -614,30 +1051,38 @@ def monitor_account(config):
                         message_id = (msg.get('Message-ID') or '').strip()
                         mail_key = message_id or f'{from_addr}|{subject}|{raw_date}'
 
-                        # 去重占位:已推送过的邮件跳过重复推送,并顺手补标记已读
-                        # (防止"推送成功但 store 标记已读失败"或同邮箱多账户导致的重推)
+                        # 去重占位:已推送过的邮件跳过重复推送,并顺手补标记
+                        # (防止"推送成功但标记失败"或同邮箱多账户导致的重推)
                         if not _try_mark_pushed(mail_key):
                             print(f"[{imap_user}] ⏭️  该邮件已推送过,跳过重复推送: {subject}")
-                            try:
-                                mail.uid('store', uid, '+FLAGS', '\\Seen')
-                            except Exception:
-                                pass
+                            _apply_push_state(mail, uid, push_mode, store_flags)
                             continue
 
-                        # 推送重试已达上限:标记已读放弃,避免每轮反复重试
+                        # 推送重试已达上限:标记放弃,避免每轮反复重试
                         if failed_count.get(uid, 0) >= max_retries:
-                            print(f"[{imap_user}] ⏭️  推送重试已达上限({max_retries} 次),标记已读放弃: {subject}")
-                            mail.uid('store', uid, '+FLAGS', '\\Seen')
+                            print(f"[{imap_user}] ⏭️  推送重试已达上限({max_retries} 次),标记放弃: {subject}")
+                            _apply_push_state(mail, uid, push_mode, store_flags)
                             failed_count.pop(uid, None)
                             continue
 
-                        # 尝试推送，成功后才标记已读
+                        # 尝试推送
                         body_preview = body[:500] + ('...' if len(body) > 500 else '')
                         push_success = send_to_feishu(config, subject, from_addr, formatted_date, body_preview, attachments)
 
                         if push_success:
-                            _cleanup_pushed()
-                            mail.uid('store', uid, '+FLAGS', '\\Seen')
+                            # 推送成功后写状态。按模式不同:
+                            #   watermark-> 默认,不碰邮件,只靠本地水位线
+                            #   keyword  -> 自定义 keyword(存服务器)
+                            #   answered -> \Answered(客户端会显示"已回复")
+                            # \Seen 是否一起写由 MARK_SEEN 控制,共用邮箱可以关掉。
+                            try:
+                                if store_flags:
+                                    mail.uid('store', uid, '+FLAGS', store_flags)
+                                elif push_mode != 'watermark':
+                                    _mark_pushed_flag(mail, uid, push_mode)
+                            except Exception as e:
+                                # 标记失败不影响本次推送,下轮会被内存去重拦住并补标记
+                                print(f"[{imap_user}] ⚠️  标记状态失败(下轮会补标记): {e}")
                             failed_count.pop(uid, None)
                         else:
                             # 推送失败:移除去重占位,允许下轮重试
@@ -655,6 +1100,12 @@ def monitor_account(config):
             # 连接/会话异常:丢弃连接,带退避重连
             conn_errors += 1
             print(f"[{imap_user}] ⚠️  连接异常(累计 {conn_errors} 次): {e}")
+            if conn_errors == 1:
+                # 只在第一次失败时给配置排查提示,避免每 10 秒刷一遍
+                try:
+                    hint_imap_config(config)
+                except Exception:
+                    pass
             _safe_logout(mail)
             mail = None
         finally:
@@ -670,6 +1121,8 @@ def monitor_account(config):
             time.sleep(config['poll_interval'])
 
 def main():
+    probe_state_file()
+    load_uid_state()
     accounts = load_accounts()
     print(f"📡 共加载 {len(accounts)} 个邮箱账户")
     threads = []

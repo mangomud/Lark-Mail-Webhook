@@ -1,0 +1,24 @@
+# 构建上下文里不必要 / 有风险的东西
+.git
+.gitignore
+.workbuddy
+
+# 授权码在这里,绝对不能打进镜像
+.env
+.env.*
+!.env.example
+
+# 运行时数据
+data/
+uid_state.json
+uid_state.json.tmp
+
+# 本地缓存与测试
+__pycache__/
+*.py[cod]
+_test_*.py
+*.log
+
+README.md
+LICENSE
+docker-compose.yml

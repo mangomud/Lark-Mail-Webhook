@@ -1,14 +1,28 @@
-version: '3'
-
+# Compose v2 不需要 version 字段(写了反而会报 obsolete 警告),直接删掉
 services:
   lark-mail:
-    image: python:3.9-slim
+    # 用本目录的 Dockerfile 构建镜像:requests 等依赖已预装进镜像层。
+    # 原来的写法是 image: python:3.9-slim + command 里 "pip install requests && python ...",
+    # 等于【每次重启都要联网拉一遍依赖】—— 快则十几秒、慢则卡住,PyPI 抖动时直接失败,
+    # 配合 restart: always 就变成无限重启循环。现在重启是秒级的,且不依赖外网。
+    build: .
+    image: lark-mail:latest
     container_name: lark-mail
     restart: always
     working_dir: /app
     volumes:
+      # 代码单独挂载:改完脚本 docker compose restart 即生效,不需要 --build
       - ./lark-mail.py:/app/lark-mail.py
-    command: sh -c "pip install requests && python -u lark-mail.py"
+      # UID 水位线(必须挂载): 这是脚本唯一的状态来源。
+      # 不挂的话每次重启都丢进度,会跳过停机期间的历史邮件。
+      # 只有两个小文件(各约 100 字节,大小恒定),脚本自动保留 .bak 备份。
+      - ./data:/data
+    # 限制日志体积,防止长期运行把宿主磁盘吃满
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
     environment:
       # ============================================================
       # 环境变量通过 ${VAR:-默认值} 语法从 .env 文件引入:
@@ -33,7 +47,7 @@ services:
       #   feishu_webhook     飞书机器人 Webhook 地址(必填)
       #   blocked_keywords   屏蔽词,中英文逗号分隔;命中主题/正文则跳过(可选)
       #   blocked_senders    屏蔽发件人,中英文逗号分隔;命中From头则跳过(可选)
-      #   max_retries        推送失败重试上限(可选,默认 3,超限后标记已读放弃)
+      #   max_retries        推送失败重试上限(可选,默认 3,超限后标记放弃)
       #   reconnect_interval 连接复用强制重连间隔秒数(可选,默认 600)
       #
       # 方式一(推荐):在 .env 中配置 MAIL_ACCOUNTS_JSON(参考 .env.example),此处自动引入:
@@ -50,8 +64,17 @@ services:
       - MAILBOX=${MAILBOX:-INBOX}                 # 监听的邮箱文件夹
       - BLOCK_BEFORE=${BLOCK_BEFORE:-86400}       # 跳过 24 小时(86400 秒)前的邮件
       - MAX_EMAILS_PER_RUN=${MAX_EMAILS_PER_RUN:-50}  # 每次轮询最多处理 50 封
-      - MAX_RETRIES=${MAX_RETRIES:-3}             # 推送失败重试上限,超限后标记已读放弃
+      - MAX_RETRIES=${MAX_RETRIES:-3}             # 推送失败重试上限,超限后标记放弃
       - RECONNECT_INTERVAL=${RECONNECT_INTERVAL:-600}  # 连接复用:每 600 秒(10 分钟)强制重连一次
       - BATCH_DELAY=${BATCH_DELAY:-2}             # 每封邮件间隔 2 秒,防飞书限流
       - POLL_INTERVAL=${POLL_INTERVAL:-60}        # 轮询间隔 60 秒
+      # "已推送"状态的记录方式。默认 watermark —— 脚本对邮件【完全只读】:
+      # 不改已读、不改已回复、不加关键字,一条 STORE 命令都不发。
+      #   watermark 纯本地水位线(默认,不碰邮件)
+      #   keyword   自定义 keyword $LarkMailPushed(会改动邮件,一般不用)
+      #   answered  \Answered 位(客户端显示"已回复",千万别用在共用邮箱上)
+      - PUSH_MODE=${PUSH_MODE:-watermark}
+      # 推送成功后是否标记已读。默认 false —— 邮件保持原样,同事看不出被脚本处理过
+      - MARK_SEEN=${MARK_SEEN:-false}
+      - UID_STATE_FILE=${UID_STATE_FILE:-/data/uid_state.json}  # UID 水位线缓存(需持久化,见 volumes)
       - DEBUG=${DEBUG:-false}                     # true 时输出 IMAP 交互详情

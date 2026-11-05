@@ -1,0 +1,36 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.egg-info/
+
+# ---- 环境变量 / 密钥(绝对不要提交) ----
+.env
+.env.local
+.env.*.local
+.env.recovered
+.env.bak
+
+# ---- 日志 ----
+*.log
+
+# ---- 运行时数据 ----
+data/
+uid_state.json
+uid_state.json.tmp
+uid_state.json.bak
+
+# ---- AI 工作区数据(本地笔记,不外传) ----
+.workbuddy/
+
+# ---- IDE ----
+.idea/
+.vscode/
+*.swp
+
+# ---- 操作系统 ----
+.DS_Store
+Thumbs.db
